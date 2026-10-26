@@ -1,4 +1,9 @@
+import { request } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { kiroProviderPackage } from "../src/providers/kiro/index.js";
 import { KiroAuthError, type KiroTokens, type LoginCallbacks, loginKiro, refreshKiro } from "../src/providers/kiro/oauth.js";
 
 type FetchArgs = { url: string; body: Record<string, unknown>; headers: Record<string, string> };
@@ -254,5 +259,222 @@ describe("refresh", () => {
 
 		const error = await refreshKiro(socialTokens()).catch((caught: unknown) => caught);
 		expect((error as KiroAuthError).permanent).toBe(false);
+	});
+});
+
+/**
+ * Installed host contract (LoginDialogComponent): one text-input resolver.
+ * showPrompt replaces it without settling the previous promise, and submit
+ * resolves only the current resolver. Messages already on screen stay there.
+ */
+function createLoginDialog() {
+	const selectQueue: string[] = [];
+	const selectWaiters: Array<(message: string) => void> = [];
+	const promptQueue: string[] = [];
+	const promptWaiters: Array<(message: string) => void> = [];
+	let textResolver: ((value: string) => void) | null = null;
+	let selectResolver: ((value: string | undefined) => void) | null = null;
+
+	const deliver = (queue: string[], waiters: Array<(message: string) => void>, message: string) => {
+		const waiter = waiters.shift();
+		if (waiter) waiter(message);
+		else queue.push(message);
+	};
+	const wait = (queue: string[], waiters: Array<(message: string) => void>) => {
+		const queued = queue.shift();
+		if (queued !== undefined) return Promise.resolve(queued);
+		return new Promise<string>((resolve) => {
+			waiters.push(resolve);
+		});
+	};
+
+	return {
+		onSelect(prompt: { message: string }) {
+			deliver(selectQueue, selectWaiters, prompt.message);
+			return new Promise<string | undefined>((resolve) => {
+				selectResolver = resolve;
+			});
+		},
+		onPrompt(prompt: { message: string }) {
+			deliver(promptQueue, promptWaiters, prompt.message);
+			return new Promise<string>((resolve) => {
+				textResolver = resolve;
+			});
+		},
+		waitForSelect: () => wait(selectQueue, selectWaiters),
+		waitForPrompt: () => wait(promptQueue, promptWaiters),
+		choose(id: string) {
+			const resolve = selectResolver;
+			if (!resolve) throw new Error("no select in progress");
+			selectResolver = null;
+			resolve(id);
+		},
+		submit(value: string) {
+			const resolve = textResolver;
+			if (!resolve) throw new Error("no text prompt in progress");
+			textResolver = null;
+			resolve(value);
+		},
+	};
+}
+
+function requestCallback(url: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const req = request(url, (response) => {
+			response.resume();
+			response.on("end", () => resolve());
+		});
+		req.on("error", reject);
+		req.end();
+	});
+}
+
+function callbackUrlFrom(authorizeUrl: string, code = "auth-code"): string {
+	const authorize = new URL(authorizeUrl);
+	const state = authorize.searchParams.get("state");
+	const redirect = authorize.searchParams.get("redirect_uri");
+	if (!state || !redirect) throw new Error(`authorize URL missing state or redirect: ${authorizeUrl}`);
+	const port = new URL(redirect).port;
+	if (!port) throw new Error(`callback server did not publish a port: ${redirect}`);
+	const callback = new URL("http://127.0.0.1");
+	callback.port = port;
+	callback.pathname = "/oauth/callback";
+	callback.searchParams.set("code", code);
+	callback.searchParams.set("state", state);
+	return callback.toString();
+}
+
+function accountFrom(value: unknown): { name: string; access: string } {
+	if (typeof value !== "object" || value === null || !("accounts" in value)) {
+		throw new Error("login did not return an account pool");
+	}
+	const accounts = value.accounts;
+	if (!Array.isArray(accounts) || accounts.length === 0) throw new Error("login returned no accounts");
+	const account = accounts[0];
+	if (typeof account !== "object" || account === null) throw new Error("login account is missing");
+	const name = "name" in account ? account.name : undefined;
+	const access = "access" in account ? account.access : undefined;
+	if (typeof name !== "string" || typeof access !== "string") throw new Error("login account fields are not strings");
+	return { name, access };
+}
+
+describe("callback prompt versus account name", () => {
+	it("keeps a pasted callback on the authorization path", async () => {
+		mockFetch({
+			"/oauth/token": { body: { accessToken: "pasted-access", refreshToken: "pasted-refresh", expiresIn: 3600 } },
+		});
+		const agentDir = await mkdtemp(join(tmpdir(), "kiro-paste-"));
+		const dialog = createLoginDialog();
+		let authorizeUrl = "";
+		const built = await kiroProviderPackage().build({ env: {}, agentDir });
+		if (!built.oauth) throw new Error("kiro oauth login is not registered");
+
+		const settled = built.oauth
+			.login({
+				onAuth: (info: { url: string }) => {
+					authorizeUrl = info.url;
+				},
+				onPrompt: dialog.onPrompt,
+				onSelect: dialog.onSelect,
+				onDeviceCode: vi.fn(),
+			})
+			.then(
+				(value) => ({ kind: "done" as const, value }),
+				(error: unknown) => ({ kind: "error" as const, error }),
+			);
+
+		try {
+			const selectWait = dialog.waitForSelect();
+			await selectWait;
+			let promptWait = dialog.waitForPrompt();
+			dialog.choose("google");
+
+			for (;;) {
+				const outcome = await Promise.race([
+					promptWait.then((message) => ({ kind: "prompt" as const, message })),
+					settled,
+				]);
+				if (outcome.kind !== "prompt") {
+					expect(outcome.kind).toBe("done");
+					if (outcome.kind === "done") expect(accountFrom(outcome.value).name).toBe("work");
+					break;
+				}
+				promptWait = dialog.waitForPrompt();
+				if (!authorizeUrl) dialog.submit("work");
+				else dialog.submit(callbackUrlFrom(authorizeUrl, "pasted-code"));
+			}
+
+			const exchange = calls.find((call) => call.url.includes("/oauth/token"));
+			expect(exchange?.body.code).toBe("pasted-code");
+		} finally {
+			await settled;
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not accept the callback URL as the account name when the local server wins", async () => {
+		mockFetch({
+			"/oauth/token": { body: { accessToken: "server-access", refreshToken: "server-refresh", expiresIn: 3600 } },
+		});
+		const agentDir = await mkdtemp(join(tmpdir(), "kiro-race-"));
+		const dialog = createLoginDialog();
+		let authorizeUrl = "";
+		const built = await kiroProviderPackage().build({ env: {}, agentDir });
+		if (!built.oauth) throw new Error("kiro oauth login is not registered");
+
+		const settled = built.oauth
+			.login({
+				onAuth: (info: { url: string }) => {
+					authorizeUrl = info.url;
+				},
+				onPrompt: dialog.onPrompt,
+				onSelect: dialog.onSelect,
+				onDeviceCode: vi.fn(),
+			})
+			.then(
+				(value) => ({ kind: "done" as const, value }),
+				(error: unknown) => ({ kind: "error" as const, error }),
+			);
+
+		try {
+			await dialog.waitForSelect();
+			let promptWait = dialog.waitForPrompt();
+			dialog.choose("google");
+
+			await promptWait;
+			if (!authorizeUrl) {
+				promptWait = dialog.waitForPrompt();
+				dialog.submit("work");
+				await promptWait;
+			}
+			expect(authorizeUrl).not.toBe("");
+
+			const afterCapture = dialog.waitForPrompt();
+			await requestCallback(callbackUrlFrom(authorizeUrl, "server-code"));
+			const outcome = await Promise.race([
+				afterCapture.then((promptMessage) => ({ kind: "prompt" as const, promptMessage })),
+				settled,
+			]);
+
+			if (outcome.kind === "prompt") {
+				// The paste instruction is still on screen. The user submits the URL
+				// to whatever prompt now owns the single resolver.
+				dialog.submit(callbackUrlFrom(authorizeUrl, "server-code"));
+				const result = await settled;
+				const errorMessage = result.kind === "error" && result.error instanceof Error ? result.error.message : "";
+				expect(errorMessage).not.toMatch(/Invalid account name/);
+			}
+
+			expect(outcome.kind).toBe("done");
+			if (outcome.kind === "done") {
+				expect(accountFrom(outcome.value).name).toBe("work");
+				expect(accountFrom(outcome.value).access).toBe("server-access");
+			}
+			const exchange = calls.find((call) => call.url.includes("/oauth/token"));
+			expect(exchange?.body.code).toBe("server-code");
+		} finally {
+			await settled;
+			await rm(agentDir, { recursive: true, force: true });
+		}
 	});
 });

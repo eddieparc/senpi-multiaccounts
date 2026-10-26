@@ -91,8 +91,9 @@ async function addFlow(state: AccountPoolState, callbacks: LoginCallbacks): Prom
 	});
 	if (method === undefined) throw new Error("Kiro sign-in cancelled");
 
-	const tokens = await loginKiro(callbacks as never, method as KiroAuthMethod);
-
+	// Name before loginKiro. The paste prompt stays pending when the local
+	// callback server wins its race, and the host dialog has one text resolver.
+	// A later onPrompt would take the URL pasted into that still-open prompt.
 	const suggested = nextDefaultName(state);
 	const answer = (
 		await callbacks.onPrompt({
@@ -105,6 +106,8 @@ async function addFlow(state: AccountPoolState, callbacks: LoginCallbacks): Prom
 	).trim();
 	const name = answer || suggested;
 	assertValidAccountName(name);
+
+	const tokens = await loginKiro(callbacks as never, method as KiroAuthMethod);
 
 	// Best-effort: the email makes the account list far easier to read, but a
 	// failed lookup must not lose a successful login.
