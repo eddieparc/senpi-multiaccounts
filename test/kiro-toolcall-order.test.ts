@@ -129,3 +129,51 @@ describe("Kiro native tool-call event order", () => {
 		expect(end?.toolCall).toMatchObject({ id: "toolu_only", name: "Bash", arguments: { command: "echo solo" } });
 	});
 });
+
+describe("Kiro request built from a transcript context", () => {
+	it("sends tools and the system prompt that arrive as system messages", async () => {
+		let sent: Record<string, unknown> | undefined;
+		globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+			sent = JSON.parse(String(init?.body));
+			return new Response(new ReadableStream<Uint8Array>({ start: (controller) => controller.close() }), { status: 200 });
+		});
+		const logger = new DebugLogger({ extensionRoot: "/tmp/senpi-accounts-test", debug: false });
+		const context = {
+			messages: [
+				{
+					role: "system",
+					content: "transcript system prompt",
+					toolsAdded: [
+						{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+						{ name: "gone", description: "Removed later", parameters: { type: "object", properties: {} } },
+					],
+					timestamp: 0,
+				},
+				{ role: "system", content: "", toolsRemoved: [{ name: "gone" }], timestamp: 1 },
+				{ role: "user", content: "go", timestamp: 2 },
+			],
+		} as unknown as Context;
+		const stream = createKiroStream(
+			{
+				providerId: "kiro",
+				upstreamUrl: "https://example.invalid/generate",
+				endpoint: "codewhisperer",
+				apiKey: "managed",
+				requestTimeoutMs: 1_000,
+				headers: {},
+			},
+			{},
+			logger,
+		)(model(), context, { apiKey: "access-token" });
+		for await (const _event of stream as unknown as AsyncIterable<unknown>) {
+			// drain
+		}
+
+		const state = sent?.conversationState as {
+			currentMessage: { userInputMessage: { content: string; userInputMessageContext?: { tools?: { toolSpecification: { name: string } }[] } } };
+		};
+		const tools = state.currentMessage.userInputMessage.userInputMessageContext?.tools ?? [];
+		expect(tools.map((tool) => tool.toolSpecification.name)).toEqual(["read"]);
+		expect(JSON.stringify(sent)).toContain("transcript system prompt");
+	});
+});

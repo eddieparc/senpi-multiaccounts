@@ -290,7 +290,10 @@ async function loginSocial(authMethod: "google" | "github", callbacks: LoginCall
 		let callbackInput: string;
 		if (server) {
 			// Race the captured redirect against a manual paste so a blocked
-			// browser redirect never strands the login.
+			// browser redirect never strands the login. If the server wins, this
+			// onPrompt stays pending and remains the host dialog's current text
+			// input. Do not call onPrompt again after loginKiro returns: a second
+			// prompt overwrites that single resolver and consumes the paste.
 			const manual = callbacks
 				.onPrompt({ message: "Paste the Kiro callback URL (only if the browser did not return automatically)", placeholder: server.callbackUrl })
 				.then((value) => ({ source: "manual" as const, value }));

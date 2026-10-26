@@ -247,6 +247,52 @@ function isKiroCliInjectedTool(tool: Tool): boolean {
   return false;
 }
 
+type TranscriptSystemMessage = {
+  role: "system";
+  content: string | TextContent[];
+  sections?: Record<string, string | null>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: { name: string }[];
+};
+
+function transcriptSystemMessages(context: Context): TranscriptSystemMessage[] {
+  return (context.messages as readonly { role: string }[]).filter(
+    (message): message is TranscriptSystemMessage => message.role === "system",
+  );
+}
+
+/**
+ * Current senpi hosts send tools and the system prompt as `system` transcript
+ * messages (`toolsAdded`/`toolsRemoved`, `content`, `sections`) and leave
+ * `context.tools`/`context.systemPrompt` empty. Replay them the way pi-ai's
+ * getCurrentTools/getCurrentSystemPrompt do; that module is not a runtime
+ * dependency of this addon (see runtime.ts).
+ */
+function contextTools(context: Context): Tool[] {
+  if (context.tools && context.tools.length > 0) return context.tools;
+  const tools = new Map<string, Tool>();
+  for (const message of transcriptSystemMessages(context)) {
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+  return [...tools.values()];
+}
+
+function contextSystemPrompt(context: Context): string {
+  if (typeof context.systemPrompt === "string" && context.systemPrompt.trim()) return context.systemPrompt;
+  const content: string[] = [];
+  const sections = new Map<string, string>();
+  for (const message of transcriptSystemMessages(context)) {
+    const text = typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join("\n");
+    if (text.length > 0) content.push(text);
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+  }
+  return [content.join("\n\n"), ...sections.values()].filter((part) => part.length > 0).join("\n\n");
+}
+
 function buildKiroTools(tools: Tool[] | undefined): KiroToolSpecification[] | undefined {
   if (!tools || tools.length === 0) return undefined;
   const filteredTools = tools.filter((tool) => !isKiroCliInjectedTool(tool));
@@ -297,7 +343,7 @@ function makeUserMessage(content: string, modelId: string, context?: KiroUserInp
 
 function convertMessages(context: Context, modelId: string): { history: KiroConversationMessage[]; currentMessage: KiroUserInputMessage } {
   const history: KiroConversationMessage[] = [];
-  const tools = buildKiroTools(context.tools);
+  const tools = buildKiroTools(contextTools(context));
   let pendingUserContent: string[] = [];
   let pendingToolResults: KiroToolResult[] = [];
   let currentRole: "user" | "assistant" | null = null;
@@ -400,7 +446,7 @@ function uuidFromHash(value: string): string {
 }
 
 function buildSystemPrefix(context: Context): string {
-  const systemPrompt = typeof context.systemPrompt === "string" ? context.systemPrompt.trim() : "";
+  const systemPrompt = contextSystemPrompt(context).trim();
   if (!systemPrompt || isKiroCliDefaultAgentInstruction(systemPrompt)) return "";
   return `<Pi system instructions>\n${systemPrompt}\n</Pi system instructions>`;
 }
